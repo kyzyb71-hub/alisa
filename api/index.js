@@ -11,7 +11,8 @@ const TOTAL_BUDGET_MS = Number(process.env.TIME_BUDGET_MS) || 2700;
 const SEARCH_TIMEOUT_MS = 1000;
 const STATE_MAX_BYTES = 950; // лимит Яндекса на session_state — 1 КБ
 const STORED_MSG_CHARS = 110;
-const MAX_REPLY_CHARS = 600;
+const MAX_REPLY_CHARS = 1000; // Алиса принимает до 1024 символов
+const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS) || 450;
 
 const HELLO = 'Привет! Я умный помощник на базе Gemini. Спросите меня о чём угодно, например, какие сегодня новости.';
 const HELP = 'Я отвечаю на вопросы, помню контекст разговора и умею искать свежую информацию в интернете. Скажите «начать заново», чтобы я забыла разговор, или «хватит», чтобы выйти.';
@@ -83,7 +84,7 @@ async function askGemini(question, history, searchContext, timeoutMs) {
 
   const now = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow', dateStyle: 'full', timeStyle: 'short' });
   const system = [
-    'Ты голосовой ассистент в навыке Яндекс Алисы. Отвечай по-русски, коротко и по делу: 1–3 простых предложения, до 300 символов.',
+    'Ты голосовой ассистент в навыке Яндекс Алисы. Отвечай по-русски, по делу и развёрнуто: 3–6 простых предложений, примерно 400–700 символов. Всегда заканчивай мысль полным предложением.',
     'Текст будет озвучен голосом: никакого markdown, списков, эмодзи, ссылок и таблиц. Числа и сокращения пиши так, чтобы их было удобно произнести.',
     'Учитывай предыдущие реплики разговора. Если не уверена — честно скажи.',
     SWEAR ? 'Твой характер: дерзкая, с чёрным юмором, говоришь как свой человек и не стесняешься русского мата — вставляй его естественно, для эмоций и смеха, но не оскорбляй самого собеседника и всё равно отвечай по существу.' : '',
@@ -100,9 +101,10 @@ async function askGemini(question, history, searchContext, timeoutMs) {
     const left = deadline - Date.now();
     if (left < 300) break;
     // Минимальное «размышление» — иначе не уложиться в 3 секунды Алисы.
-    const generationConfig = { temperature: 0.6, maxOutputTokens: 220, thinkingConfig: { thinkingLevel: 'minimal' } };
+    const generationConfig = { temperature: 0.6, maxOutputTokens: MAX_OUTPUT_TOKENS, thinkingConfig: { thinkingLevel: 'minimal' } };
 
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    // Потоковый ответ: если время кончается, отдаём то, что уже успели получить.
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
       body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig }),
@@ -110,10 +112,36 @@ async function askGemini(question, history, searchContext, timeoutMs) {
     });
     if (r.status === 404) { lastErr = new Error(`model ${model} not found`); continue; }
     if (!r.ok) throw new Error(`Gemini ${r.status}: ${(await r.text()).slice(0, 300)}`);
-    const data = await r.json();
-    return (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+    return await readStream(r.body);
   }
   throw lastErr || Object.assign(new Error('no time left'), { name: 'TimeoutError' });
+}
+
+// Собираем текст из SSE-потока Gemini. По таймауту возвращаем накопленное, если оно есть.
+async function readStream(body) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let text = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const chunk = safeJson(line.slice(5));
+        text += (chunk.candidates?.[0]?.content?.parts || []).map((p) => (p.thought ? '' : p.text || '')).join('');
+      }
+    }
+  } catch (err) {
+    if (!text.trim()) throw err;
+    reader.cancel().catch(() => {});
+  }
+  return text.trim();
 }
 
 async function serperSearch(q, timeoutMs) {
@@ -142,16 +170,26 @@ function buildQuery(utterance, history) {
   return lastUser ? `${lastUser[1]} ${utterance}` : utterance;
 }
 
-function toSpeech(s) {
-  return String(s || '')
+function toSpeech(raw) {
+  const s = String(raw || '')
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
     .replace(/https?:\/\/\S+/g, '')
     .replace(/[*_#`>|~]/g, '')
     .replace(/^\s*[-•]\s+/gm, '')
     .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, MAX_REPLY_CHARS);
+    .trim();
+  return cutToSentence(s, MAX_REPLY_CHARS);
+}
+
+// Обрезаем по последнему законченному предложению, чтобы Алиса не обрывалась на полуслове.
+function cutToSentence(s, max) {
+  const m = s.match(/^[\s\S]*[.!?…](?=\s|$)/);
+  const full = m ? m[0] : s;
+  if (full.length <= max) return full.length > s.length * 0.5 ? full : s.slice(0, max);
+  const cut = full.slice(0, max);
+  const i = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
+  return i > 0 ? cut.slice(0, i + 1) : cut;
 }
 
 function clip(s) {
