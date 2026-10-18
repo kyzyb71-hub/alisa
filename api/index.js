@@ -3,7 +3,8 @@
 
 const GEMINI_KEY = process.env.GEMINI_APLKEY;
 const SERPER_KEY = process.env.SERPER_APLKEY;
-const SWEAR = process.env.SWEAR !== '0'; // SWEAR=0 в Vercel — вежливый режим
+// SWEAR в Vercel: не задан — с матом, soft — без мата (блин, капец…), 0 — вежливый режим.
+const SWEAR = process.env.SWEAR === '0' ? 'off' : process.env.SWEAR === 'soft' ? 'soft' : 'mat';
 // Модели перебираются по кругу: у каждой своя квота, поэтому вместе лимит намного больше.
 // Свой список можно задать в Vercel: GEMINI_MODELS=модель1,модель2,...
 const MODELS = (process.env.GEMINI_MODELS || [
@@ -70,7 +71,7 @@ export default async function handler(req, res) {
   const reply = (text, opts = {}) => {
     const out = {
       version,
-      response: { text: text.slice(0, 1024), end_session: Boolean(opts.end) },
+      response: { text: text.slice(0, 1024), ...(opts.tts && { tts: opts.tts.slice(0, 1024) }), end_session: Boolean(opts.end) },
       session_state: packState(opts.history ?? history),
     };
     return res.status(200).json(out);
@@ -97,10 +98,13 @@ export default async function handler(req, res) {
 
     const remaining = TOTAL_BUDGET_MS - (Date.now() - started);
     const answer = await askGemini(utterance, history, searchContext, remaining);
-    const text = toSpeech(answer) || 'Не знаю, что ответить. Спросите иначе.';
+    let voice = toSpeech(answer) || 'Не знаю, что ответить. Спросите иначе.';
+    if (SWEAR !== 'mat') voice = voice.replace(MAT_RE, 'блин');
+    // Яндекс меняет мат в тексте на «<censored>», поэтому на экран — со звёздочками, а в голос (tts) — как есть.
+    const text = voice.replace(MAT_RE, (w) => w[0] + '*'.repeat(w.length - 1));
 
     history = [...history, ['u', clip(utterance)], ['m', clip(text)]];
-    return reply(text, { history });
+    return reply(text, { history, tts: voice !== text ? voice : undefined });
   } catch (err) {
     console.error('handler error:', err?.name, err?.message);
     if (err?.quota) return reply(QUOTA_REPLY);
@@ -116,7 +120,8 @@ async function askGemini(question, history, searchContext, timeoutMs) {
     'Ты голосовой ассистент в навыке Яндекс Алисы. Отвечай по-русски, по делу и развёрнуто: 3–6 простых предложений, примерно 400–700 символов. Всегда заканчивай мысль полным предложением.',
     'Текст будет озвучен голосом: никакого markdown, списков, эмодзи, ссылок и таблиц. Числа и сокращения пиши так, чтобы их было удобно произнести.',
     'Учитывай предыдущие реплики разговора. Если не уверена — честно скажи.',
-    SWEAR ? 'Твой характер: дерзкая, с чёрным юмором, говоришь как свой человек и не стесняешься русского мата — вставляй его естественно, для эмоций и смеха, но не оскорбляй самого собеседника и всё равно отвечай по существу.' : '',
+    SWEAR === 'mat' ? 'Твой характер: дерзкая, с чёрным юмором, говоришь как свой человек и не стесняешься русского мата — вставляй его естественно, для эмоций и смеха, но не оскорбляй самого собеседника и всё равно отвечай по существу.' : '',
+    SWEAR === 'soft' ? 'Твой характер: дерзкая, с чёрным юмором, говоришь как свой человек. Матом не ругайся, вместо него используй хлёсткие разговорные словечки: блин, капец, офигеть, чёрт, жесть, хрень, задолбало. Собеседника не оскорбляй и всё равно отвечай по существу.' : '',
     `Сейчас ${now} по Москве.`,
     searchContext ? `Свежие результаты поиска в интернете (используй их, если они относятся к вопросу):\n${searchContext}` : '',
   ].filter(Boolean).join('\n');
@@ -230,12 +235,16 @@ function buildQuery(utterance, history) {
   return lastUser ? `${lastUser[1]} ${utterance}` : utterance;
 }
 
+// Мат, который Яндекс в поле text превращает в «<censored>» (Алиса читает это как «меньше чем цензор больше чем»).
+const MAT_RE = /(?<![а-яё])(?:(?:за|на|вы|до|по|у|от|об|разъ|съ|въ|подъ|объ|при|про|рас|пере)?(?:[её]б(?:а|л|у|о|ну|ан|ён|ен|ищ)|хуй|хуе|хуё|хуя|хуи|пизд|бля|мудак|мудил|пидор|пидар|залуп|сук[аиуе]|сучк))[а-яё]*/gi;
+
 function toSpeech(raw) {
   const s = String(raw || '')
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
     .replace(/https?:\/\/\S+/g, '')
-    .replace(/[*_#`>|~]/g, '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/[*_#`<>|~]/g, '')
     .replace(/^\s*[-•]\s+/gm, '')
     .replace(/\s+/g, ' ')
     .trim();
