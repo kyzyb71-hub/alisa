@@ -40,7 +40,7 @@ const SEARCH_TIMEOUT_MS = 1000;
 const STATE_MAX_BYTES = 950; // лимит Яндекса на session_state — 1 КБ
 const STORED_MSG_CHARS = 110;
 const MAX_REPLY_CHARS = 1000; // Алиса принимает до 1024 символов
-const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS) || 450;
+const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS) || 300;
 
 const HELLO = 'Привет! Я умный помощник на базе Gemini. Спросите меня о чём угодно, например, какие сегодня новости.';
 const HELP = 'Я отвечаю на вопросы, помню контекст разговора и умею искать свежую информацию в интернете. Скажите «начать заново», чтобы я забыла разговор, или «хватит», чтобы выйти.';
@@ -122,7 +122,7 @@ async function askGemini(question, history, searchContext, timeoutMs) {
 
   const now = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow', dateStyle: 'full', timeStyle: 'short' });
   const system = [
-    'Ты голосовой ассистент в навыке Яндекс Алисы. Отвечай по-русски, по делу и развёрнуто: 3–6 простых предложений, примерно 400–700 символов. Всегда заканчивай мысль полным предложением.',
+    'Ты голосовой ассистент в навыке Яндекс Алисы. Отвечай по-русски, коротко и по делу: не больше 5 коротких простых предложений, до 400 символов. Всегда заканчивай мысль полным предложением.',
     'Текст будет озвучен голосом: никакого markdown, списков, эмодзи, ссылок и таблиц. Числа и сокращения пиши так, чтобы их было удобно произнести.',
     'Учитывай предыдущие реплики разговора. Если не уверена — честно скажи.',
     SWEAR === 'mat' ? [
@@ -289,6 +289,9 @@ const TRICKS = [
   (w) => w.slice(0, Math.ceil(w.length / 2)) + '-' + w.slice(Math.ceil(w.length / 2)), // 4: дефис посередине слова
   (w) => w.replace(/[аеёиоуыэюя]/i, '$&$&'), // 5: растянутая гласная
   (w) => [...w.toLowerCase()].map((c) => TRANSLIT[c] ?? c).join(''), // 6: целиком латиницей
+  (w) => w.slice(0, Math.ceil(w.length / 2)) + ' sil <[1]> ' + w.slice(Math.ceil(w.length / 2)), // 7: пауза 1 мс посередине
+  (w) => w.replace(/[аеёиоуыэюя]/i, '$&́'), // 8: невидимый значок ударения над гласной
+  (w) => w.slice(0, Math.ceil(w.length / 2)) + ' ' + w.slice(Math.ceil(w.length / 2)), // 9: пробел посередине
   // Знак ударения «+» (бл+ять) не подошёл: Алиса вместо мата читает «плюс».
 ];
 function disguise(w, trick) {
@@ -299,7 +302,7 @@ function disguise(w, trick) {
 function matTest(reply) {
   const phrase = 'Ну пиздец, сука, бля, иди нахуй';
   const say = (n) => phrase.replace(MAT_RE, (w) => disguise(w, n));
-  const nums = ['', 'один', 'два', 'три', 'четыре', 'пять', 'шесть'];
+  const nums = ['', 'один', 'два', 'три', 'четыре', 'пять', 'шесть', 'семь', 'восемь', 'девять'];
   const tts = TRICKS.slice(1).map((_, i) => `Вариант ${nums[i + 1]}. sil <[400]> ${say(i + 1)}. sil <[700]>`).join(' ');
   const text = `Проверка мата: ${TRICKS.length - 1} вариантов. Какой номер прозвучал без писка — поставьте его в Vercel в переменную TTS_TRICK. Сейчас стоит ${TTS_TRICK}.`;
   return reply(text, { tts });
