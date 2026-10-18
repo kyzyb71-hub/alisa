@@ -91,6 +91,7 @@ export default async function handler(req, res) {
   if (!GEMINI_KEY) return reply('Навык ещё не настроен: не задан ключ Gemini.');
 
   try {
+    availableModels(); // список моделей грузится параллельно с поиском
     let searchContext = '';
     if (SERPER_KEY && SEARCH_RE.test(utterance)) {
       searchContext = await serperSearch(buildQuery(utterance, history), SEARCH_TIMEOUT_MS).catch(() => '');
@@ -104,7 +105,9 @@ export default async function handler(req, res) {
     const text = voice.replace(MAT_RE, (w) => w[0] + '*'.repeat(w.length - 1));
 
     history = [...history, ['u', clip(utterance)], ['m', clip(text)]];
-    return reply(text, { history, tts: voice !== text ? voice : undefined });
+    // В голосе Яндекс мат «запикивает». Знак ударения «+» внутри слова (бл+ять) сбивает фильтр, а произносится как обычно.
+    const tts = voice.replace(MAT_RE, (w) => w.replace(/[аеёиоуыэюя]/i, '+$&'));
+    return reply(text, { history, tts: tts !== text ? tts : undefined });
   } catch (err) {
     console.error('handler error:', err?.name, err?.message);
     if (err?.quota) return reply(QUOTA_REPLY);
@@ -120,7 +123,12 @@ async function askGemini(question, history, searchContext, timeoutMs) {
     'Ты голосовой ассистент в навыке Яндекс Алисы. Отвечай по-русски, по делу и развёрнуто: 3–6 простых предложений, примерно 400–700 символов. Всегда заканчивай мысль полным предложением.',
     'Текст будет озвучен голосом: никакого markdown, списков, эмодзи, ссылок и таблиц. Числа и сокращения пиши так, чтобы их было удобно произнести.',
     'Учитывай предыдущие реплики разговора. Если не уверена — честно скажи.',
-    SWEAR === 'mat' ? 'Твой характер: дерзкая, с чёрным юмором, говоришь как свой человек и не стесняешься русского мата — вставляй его естественно, для эмоций и смеха, но не оскорбляй самого собеседника и всё равно отвечай по существу.' : '',
+    SWEAR === 'mat' ? [
+      'Твой характер: дерзкая стендап-комедиантка с чёрным юмором, говоришь как свой человек и смачно материшься.',
+      'Мат у тебя — приправа к шутке, а не ради мата: вставляй его туда, где он делает фразу смешнее, в неожиданных сравнениях, абсурдных образах и панчлайнах.',
+      'В каждом ответе должна быть хотя бы одна шутка, подкол или ироничное наблюдение; можно самоиронию про то, что ты нейросеть в колонке.',
+      'Собеседника подкалывай по-дружески, но не оскорбляй всерьёз. И всё равно отвечай по существу: сначала суть, сверху юмор.',
+    ].join(' ') : '',
     SWEAR === 'soft' ? 'Твой характер: дерзкая, с чёрным юмором, говоришь как свой человек. Матом не ругайся, вместо него используй хлёсткие разговорные словечки: блин, капец, офигеть, чёрт, жесть, хрень, задолбало. Собеседника не оскорбляй и всё равно отвечай по существу.' : '',
     `Сейчас ${now} по Москве.`,
     searchContext ? `Свежие результаты поиска в интернете (используй их, если они относятся к вопросу):\n${searchContext}` : '',
@@ -130,8 +138,12 @@ async function askGemini(question, history, searchContext, timeoutMs) {
   contents.push({ role: 'user', parts: [{ text: question }] });
 
   const deadline = Date.now() + timeoutMs;
-  const start = nextModel++ % MODELS.length;
-  const order = [...MODELS.slice(start), ...MODELS.slice(0, start)];
+  // Выкидываем модели, которых нет у этого ключа, — иначе время уходит на ошибки 404.
+  const avail = await availableModels();
+  const known = avail ? MODELS.filter((m) => avail.has(m)) : [];
+  const models = known.length ? known : MODELS;
+  const start = nextModel++ % models.length;
+  const order = [...models.slice(start), ...models.slice(0, start)];
   const ready = order.filter((m) => !(cooldownUntil.get(m) > Date.now()));
   let lastErr;
   for (const model of ready.length ? ready : order) {
@@ -154,10 +166,34 @@ async function askGemini(question, history, searchContext, timeoutMs) {
       continue; // пробуем следующую модель
     }
     // Потоковый ответ: если время кончается, отдаём то, что уже успели получить.
-    return await readStream(r.body);
+    const text = await readStream(r.body);
+    if (text) return text;
+    console.error(`Gemini ${model}: пустой ответ (вероятно, фильтр безопасности)`);
+    lastErr = new Error(`Gemini ${model} empty`);
   }
   throw lastErr || Object.assign(new Error('no time left'), { name: 'TimeoutError' });
 }
+
+// Список моделей, доступных ключу. Запрос бесплатный (не тратит квоту), кэшируем на час.
+let modelsCache = null;
+function availableModels() {
+  if (modelsCache && Date.now() - modelsCache.at < 60 * 60_000) return modelsCache.p;
+  const p = fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000', {
+    headers: { 'x-goog-api-key': GEMINI_KEY },
+    signal: AbortSignal.timeout(900),
+  })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`list ${r.status}`))))
+    .then((d) => new Set((d.models || [])
+      .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map((m) => m.name.replace(/^models\//, ''))))
+    .catch((err) => { console.error('models list:', err?.message); modelsCache = null; return null; });
+  modelsCache = { at: Date.now(), p };
+  return p;
+}
+
+// Фильтры безопасности Gemini режут дерзкие ответы в пустоту — отключаем их.
+const SAFETY_OFF = ['HARASSMENT', 'HATE_SPEECH', 'SEXUALLY_EXPLICIT', 'DANGEROUS_CONTENT']
+  .map((c) => ({ category: `HARM_CATEGORY_${c}`, threshold: 'BLOCK_NONE' }));
 
 // У разных семейств моделей разные настройки «размышления» и поддержка системной инструкции.
 function buildRequest(model, system, contents) {
@@ -172,7 +208,7 @@ function buildRequest(model, system, contents) {
     const merged = { role: 'user', parts: [{ text: `${system}\n\n${first.parts[0].text}` }] };
     return { contents: first.role === 'user' ? [merged, ...rest] : [{ role: 'user', parts: [{ text: system }] }, ...contents], generationConfig };
   }
-  return { systemInstruction: { parts: [{ text: system }] }, contents, generationConfig };
+  return { systemInstruction: { parts: [{ text: system }] }, contents, generationConfig, safetySettings: SAFETY_OFF };
 }
 
 // 429 — лимит: дневной ждём подольше, поминутный — минуту. 404/400/403 — модель недоступна этому ключу.
