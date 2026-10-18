@@ -54,6 +54,7 @@ const SEARCH_RE = /(новост|сегодня|вчера|завтра|сейч
 const EXIT_RE = /^(хватит|стоп|выход|выйти|закончить|пока|до свидания|алиса хватит)$/i;
 const RESET_RE = /^(начать заново|начни заново|забудь( всё| все)?|сброс|новый разговор)$/i;
 const HELP_RE = /^(помощь|помоги|что ты умеешь|что ты можешь|справка)$/i;
+const MAT_TEST_RE = /^(тест мата|проверка мата)$/i;
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -87,6 +88,7 @@ export default async function handler(req, res) {
   if (EXIT_RE.test(command)) return reply(BYE, { end: true, history: [] });
   if (RESET_RE.test(command)) return reply(RESET, { history: [] });
   if (HELP_RE.test(command)) return reply(HELP);
+  if (MAT_TEST_RE.test(command)) return matTest(reply);
 
   if (!GEMINI_KEY) return reply('Навык ещё не настроен: не задан ключ Gemini.');
 
@@ -105,8 +107,8 @@ export default async function handler(req, res) {
     const text = voice.replace(MAT_RE, (w) => w[0] + '*'.repeat(w.length - 1));
 
     history = [...history, ['u', clip(utterance)], ['m', clip(text)]];
-    // В голосе Яндекс мат «запикивает». Знак ударения «+» внутри слова (бл+ять) сбивает фильтр, а произносится как обычно.
-    const tts = voice.replace(MAT_RE, (w) => w.replace(/[аеёиоуыэюя]/i, '+$&'));
+    // В голосе Яндекс мат «запикивает» — маскируем слова способом из TTS_TRICK (подобрать: скажите «тест мата»).
+    const tts = voice.replace(MAT_RE, (w) => disguise(w, TTS_TRICK));
     return reply(text, { history, tts: tts !== text ? tts : undefined });
   } catch (err) {
     console.error('handler error:', err?.name, err?.message);
@@ -270,6 +272,36 @@ function buildQuery(utterance, history) {
   if (utterance.split(/\s+/).length > 3) return utterance;
   const lastUser = [...history].reverse().find(([r]) => r === 'u');
   return lastUser ? `${lastUser[1]} ${utterance}` : utterance;
+}
+
+// Способы спрятать мат от «пищалки» Яндекса так, чтобы синтез речи всё равно его произнёс.
+// Номер задаётся в Vercel переменной TTS_TRICK; какой работает — проверяется командой «тест мата».
+const TTS_TRICK = Number(process.env.TTS_TRICK) || 1;
+const LATIN = { а: 'a', е: 'e', о: 'o', р: 'p', с: 'c', у: 'y', х: 'x', к: 'k' };
+const TRANSLIT = { а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'zh', з: 'z', и: 'i', й: 'y', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'kh', ц: 'ts', ч: 'ch', ш: 'sh', щ: 'sch', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya' };
+const TRICKS = [
+  null,
+  // 1: русские буквы → похожие латинские (в «бля» таких нет — там мягкий перенос)
+  (w) => { const v = w.replace(/[аеорсухк]/gi, (c) => LATIN[c.toLowerCase()] || c); return v !== w ? v : TRICKS[2](w); },
+  (w) => w.slice(0, 2) + '­' + w.slice(2), // 2: невидимый мягкий перенос внутри слова
+  (w) => w.slice(0, 2) + '​' + w.slice(2), // 3: невидимый пробел нулевой ширины
+  (w) => w.slice(0, Math.ceil(w.length / 2)) + '-' + w.slice(Math.ceil(w.length / 2)), // 4: дефис посередине слова
+  (w) => w.replace(/[аеёиоуыэюя]/i, '$&$&'), // 5: растянутая гласная
+  (w) => [...w.toLowerCase()].map((c) => TRANSLIT[c] ?? c).join(''), // 6: целиком латиницей
+  // Знак ударения «+» (бл+ять) не подошёл: Алиса вместо мата читает «плюс».
+];
+function disguise(w, trick) {
+  return (TRICKS[trick] || TRICKS[1])(w);
+}
+
+// «Тест мата»: Алиса произносит одну фразу всеми способами — слушаем, какой номер не пикает.
+function matTest(reply) {
+  const phrase = 'Ну пиздец, сука, бля';
+  const say = (n) => phrase.replace(MAT_RE, (w) => disguise(w, n));
+  const nums = ['', 'один', 'два', 'три', 'четыре', 'пять', 'шесть'];
+  const tts = TRICKS.slice(1).map((_, i) => `Вариант ${nums[i + 1]}. sil <[400]> ${say(i + 1)}. sil <[700]>`).join(' ');
+  const text = `Проверка мата: ${TRICKS.length - 1} вариантов. Какой номер прозвучал без писка — поставьте его в Vercel в переменную TTS_TRICK. Сейчас стоит ${TTS_TRICK}.`;
+  return reply(text, { tts });
 }
 
 // Мат, который Яндекс в поле text превращает в «<censored>» (Алиса читает это как «меньше чем цензор больше чем»).
