@@ -277,12 +277,13 @@ function buildQuery(utterance, history) {
 // Способы спрятать мат от «пищалки» Яндекса так, чтобы синтез речи всё равно его произнёс.
 // Номер задаётся в Vercel переменной TTS_TRICK; какой работает — проверяется командой «тест мата».
 const TTS_TRICK = Number(process.env.TTS_TRICK) || 1;
-const LATIN = { а: 'a', е: 'e', о: 'o', р: 'p', с: 'c', у: 'y', х: 'x', к: 'k' };
+// Латинскую x Алиса читает как «кс» (наксуй), поэтому «х» не трогаем.
+const LATIN = { а: 'a', е: 'e', о: 'o', р: 'p', с: 'c', у: 'y', к: 'k' };
 const TRANSLIT = { а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'zh', з: 'z', и: 'i', й: 'y', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'kh', ц: 'ts', ч: 'ch', ш: 'sh', щ: 'sch', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya' };
 const TRICKS = [
   null,
   // 1: русские буквы → похожие латинские (в «бля» таких нет — там мягкий перенос)
-  (w) => { const v = w.replace(/[аеорсухк]/gi, (c) => LATIN[c.toLowerCase()] || c); return v !== w ? v : TRICKS[2](w); },
+  (w) => { const v = w.replace(/[аеорсук]/gi, (c) => LATIN[c.toLowerCase()] || c); return v !== w ? v : TRICKS[2](w); },
   (w) => w.slice(0, 2) + '­' + w.slice(2), // 2: невидимый мягкий перенос внутри слова
   (w) => w.slice(0, 2) + '​' + w.slice(2), // 3: невидимый пробел нулевой ширины
   (w) => w.slice(0, Math.ceil(w.length / 2)) + '-' + w.slice(Math.ceil(w.length / 2)), // 4: дефис посередине слова
@@ -296,7 +297,7 @@ function disguise(w, trick) {
 
 // «Тест мата»: Алиса произносит одну фразу всеми способами — слушаем, какой номер не пикает.
 function matTest(reply) {
-  const phrase = 'Ну пиздец, сука, бля';
+  const phrase = 'Ну пиздец, сука, бля, иди нахуй';
   const say = (n) => phrase.replace(MAT_RE, (w) => disguise(w, n));
   const nums = ['', 'один', 'два', 'три', 'четыре', 'пять', 'шесть'];
   const tts = TRICKS.slice(1).map((_, i) => `Вариант ${nums[i + 1]}. sil <[400]> ${say(i + 1)}. sil <[700]>`).join(' ');
