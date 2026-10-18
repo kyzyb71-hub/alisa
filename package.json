@@ -1,0 +1,10 @@
+{
+  "name": "alisa-gemini-skill",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Webhook для навыка Яндекс Алисы: Gemini + Serper, контекст в session_state",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}
