@@ -4,7 +4,34 @@
 const GEMINI_KEY = process.env.GEMINI_APLKEY;
 const SERPER_KEY = process.env.SERPER_APLKEY;
 const SWEAR = process.env.SWEAR !== '0'; // SWEAR=0 в Vercel — вежливый режим
-const MODELS =[process.env.GEMINI_MODEL || 'gemini-3.5-flash', 'gemini-flash-latest'];
+// Модели перебираются по кругу: у каждой своя квота, поэтому вместе лимит намного больше.
+// Свой список можно задать в Vercel: GEMINI_MODELS=модель1,модель2,...
+const MODELS = (process.env.GEMINI_MODELS || [
+  process.env.GEMINI_MODEL || 'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite-preview',
+  'gemini-flash-latest',
+  'gemini-flash-lite-latest',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash-preview-09-2025',
+  'gemini-2.5-flash-lite-preview-09-2025',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-001',
+  'gemini-2.0-flash-lite',
+  'gemini-2.0-flash-lite-001',
+  'gemma-3-27b-it',
+  'gemma-3-12b-it',
+  'gemma-3n-e4b-it',
+  'gemma-3-4b-it',
+  'gemma-3n-e2b-it',
+  'gemma-3-1b-it',
+].join(',')).split(',').map((m) => m.trim()).filter(Boolean);
+
+// Пока инстанс Vercel «тёплый», помним, какие модели упёрлись в лимит, и временно их пропускаем.
+const cooldownUntil = new Map();
+let nextModel = 0;
 
 // Алиса ждёт ответ ~3 секунды, оставляем запас на сеть.
 const TOTAL_BUDGET_MS = Number(process.env.TIME_BUDGET_MS) || 2700;
@@ -20,6 +47,7 @@ const BYE = 'До свидания! Возвращайтесь.';
 const RESET = 'Хорошо, начнём с чистого листа. Что вас интересует?';
 const TIMEOUT_REPLY = 'Ой, я задумалась слишком надолго. Повторите вопрос, пожалуйста.';
 const ERROR_REPLY = 'Что-то пошло не так. Попробуйте спросить ещё раз.';
+const QUOTA_REPLY = 'Я на сегодня выговорилась: закончился лимит запросов к нейросети. Попробуйте чуть позже.';
 
 const SEARCH_RE = /(новост|сегодня|вчера|завтра|сейчас|на данный момент|последн|актуальн|свеж|недавн|текущ|курс|погод|цен[аыу]|стоит|стоимост|сколько стоит|сч[её]т матча|матч|турнир|чемпионат|выбор|кто выиграл|когда выйд|вышел|релиз|расписани|найди|поищи|загугли|в интернете|в сети|что случилось|что произошло|кто такой|кто такая|202[4-9])/i;
 const EXIT_RE = /^(хватит|стоп|выход|выйти|закончить|пока|до свидания|алиса хватит)$/i;
@@ -75,6 +103,7 @@ export default async function handler(req, res) {
     return reply(text, { history });
   } catch (err) {
     console.error('handler error:', err?.name, err?.message);
+    if (err?.quota) return reply(QUOTA_REPLY);
     return reply(err?.name === 'AbortError' || err?.name === 'TimeoutError' ? TIMEOUT_REPLY : ERROR_REPLY);
   }
 }
@@ -96,25 +125,56 @@ async function askGemini(question, history, searchContext, timeoutMs) {
   contents.push({ role: 'user', parts: [{ text: question }] });
 
   const deadline = Date.now() + timeoutMs;
+  const start = nextModel++ % MODELS.length;
+  const order = [...MODELS.slice(start), ...MODELS.slice(0, start)];
+  const ready = order.filter((m) => !(cooldownUntil.get(m) > Date.now()));
   let lastErr;
-  for (const model of MODELS) {
+  for (const model of ready.length ? ready : order) {
     const left = deadline - Date.now();
     if (left < 300) break;
-    // Минимальное «размышление» — иначе не уложиться в 3 секунды Алисы.
-    const generationConfig = { temperature: 0.6, maxOutputTokens: MAX_OUTPUT_TOKENS, thinkingConfig: { thinkingLevel: 'minimal' } };
 
-    // Потоковый ответ: если время кончается, отдаём то, что уже успели получить.
     const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig }),
+      body: JSON.stringify(buildRequest(model, system, contents)),
       signal: AbortSignal.timeout(left),
-    });
-    if (r.status === 404) { lastErr = new Error(`model ${model} not found`); continue; }
-    if (!r.ok) throw new Error(`Gemini ${r.status}: ${(await r.text()).slice(0, 300)}`);
+    }).catch((err) => { lastErr = err; return null; });
+    if (!r) break; // кончилось время
+
+    if (!r.ok) {
+      const errText = (await r.text().catch(() => '')).slice(0, 500);
+      console.error(`Gemini ${model} ${r.status}:`, errText.slice(0, 200));
+      cooldownUntil.set(model, Date.now() + cooldownMs(r.status, errText));
+      lastErr = Object.assign(new Error(`Gemini ${model} ${r.status}`), { quota: r.status === 429 });
+      continue; // пробуем следующую модель
+    }
+    // Потоковый ответ: если время кончается, отдаём то, что уже успели получить.
     return await readStream(r.body);
   }
   throw lastErr || Object.assign(new Error('no time left'), { name: 'TimeoutError' });
+}
+
+// У разных семейств моделей разные настройки «размышления» и поддержка системной инструкции.
+function buildRequest(model, system, contents) {
+  const generationConfig = { temperature: 0.6, maxOutputTokens: MAX_OUTPUT_TOKENS };
+  // Минимальное «размышление» — иначе не уложиться в 3 секунды Алисы.
+  if (/^gemini-3/.test(model)) generationConfig.thinkingConfig = { thinkingLevel: 'minimal' };
+  else if (/^gemini-2\.5|^gemini-flash/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+
+  if (model.startsWith('gemma')) {
+    // Gemma не принимает systemInstruction — кладём инструкцию в первое сообщение.
+    const [first, ...rest] = contents;
+    const merged = { role: 'user', parts: [{ text: `${system}\n\n${first.parts[0].text}` }] };
+    return { contents: first.role === 'user' ? [merged, ...rest] : [{ role: 'user', parts: [{ text: system }] }, ...contents], generationConfig };
+  }
+  return { systemInstruction: { parts: [{ text: system }] }, contents, generationConfig };
+}
+
+// 429 — лимит: дневной ждём подольше, поминутный — минуту. 404/400/403 — модель недоступна этому ключу.
+function cooldownMs(status, errText) {
+  if (status === 429) return /PerDay/i.test(errText) ? 30 * 60_000 : 60_000;
+  if (status === 404 || status === 400 || status === 403) return 60 * 60_000;
+  return 15_000;
 }
 
 // Собираем текст из SSE-потока Gemini. По таймауту возвращаем накопленное, если оно есть.
